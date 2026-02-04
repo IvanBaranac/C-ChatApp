@@ -1,0 +1,332 @@
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+// ============================================
+// KLIJENTSKA APLIKACIJA
+// ============================================
+// KAKO NAPRAVITI FORMU U DESIGNER-U:
+// 
+// 1. Otvori Form1 u Designer-u (dvostruki klik)
+// 2. Prevuci kontrole sa Toolbox-a i postavi Properties:
+//
+// KONTROLE:
+// ---------
+// Label1:
+//   - Text: "Server:"
+//   - AutoSize: True
+//
+// TextBox (ime: txtServer)
+//   - Text: "127.0.0.1"
+//
+// Label2:
+//   - Text: "Username:"
+//   - AutoSize: True
+//
+// TextBox (ime: txtUsername)
+//   - (ostavi prazno)
+//
+// Button (ime: btnConnect)
+//   - Text: "Connect"
+//   - Dvostruki klik na dugme (kreira event)
+//
+// Button (ime: btnLogout)
+//   - Text: "Logout"
+//   - Enabled: False
+//   - Dvostruki klik na dugme
+//
+// TextBox (ime: txtDisplay)
+//   - Multiline: True
+//   - ScrollBars: Vertical
+//   - ReadOnly: True
+//
+// Label3:
+//   - Text: "Poruka:"
+//
+// TextBox (ime: txtMessage)
+//   - Enabled: False
+//
+// Button (ime: btnSend)
+//   - Text: "Send"
+//   - Enabled: False
+//   - Dvostruki klik na dugme
+//
+// FORM Properties:
+//   - Text: "Client"
+//   - Size: 500, 450
+// ============================================
+
+namespace Client
+{
+    public partial class Form1 : Form
+    {
+        // TCP klijent za komunikaciju sa serverom
+        private TcpClient client;
+        private NetworkStream stream;
+
+        // Thread za primanje poruka
+        private Thread receiveThread;
+
+        // Da li je klijent povezan
+        private bool isConnected = false;
+
+        // ===== TIMER ZA ZATVARANJE FORME (10 sekundi) =====
+        private System.Timers.Timer formCloseTimer;
+
+        public Form1()
+        {
+            InitializeComponent();
+            StartFormCloseTimer();  // Pokreni timer odmah!
+        }
+        // Pokreće timer koji zatvara formu nakon 10 sekundi ako se korisnik ne uloguje
+        private void StartFormCloseTimer()
+        {
+            formCloseTimer = new System.Timers.Timer(10000);  // 10 sekundi
+            formCloseTimer.Elapsed += (s, e) =>
+            {
+                // Ako NIJE povezan, zatvori formu
+                if (!isConnected)
+                {
+                    CloseForm();
+                }
+            };
+            formCloseTimer.AutoReset = false;  // Samo jednom
+            formCloseTimer.Start();
+        }
+
+        // Zatvara formu (thread-safe)
+        private void CloseForm()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(CloseForm));
+                return;
+            }
+
+            MessageBox.Show("Niste se ulogovali za 10 sekundi. Aplikacija se zatvara.",
+                "Timeout", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            this.Close();  // Zatvori formu
+        }
+
+        // ===== DUGME: CONNECT =====
+        private void btnConnect_Click(object sender, EventArgs e)
+        {
+            // Provjeri da li je uneseno username
+            if (string.IsNullOrWhiteSpace(txtUsername.Text))
+            {
+                MessageBox.Show("Morate unijeti username!", "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                // Poveži se na server
+                client = new TcpClient();
+                client.Connect(txtServer.Text, 5000);  // Port 5000
+                stream = client.GetStream();
+
+                // Pošalji CONNECT komandu
+                string connectCmd = $"CONNECT {txtUsername.Text}";
+                byte[] data = Encoding.UTF8.GetBytes(connectCmd);
+                stream.Write(data, 0, data.Length);
+
+                // Pokreni thread za primanje poruka
+                receiveThread = new Thread(ReceiveMessages);
+                receiveThread.IsBackground = true;
+                receiveThread.Start();
+
+                // Onemogući ponovno povezivanje
+                btnConnect.Enabled = false;
+                txtServer.Enabled = false;
+                txtUsername.Enabled = false;
+
+                AppendMessage("Pokušavam povezivanje...");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Greška pri povezivanju:\n{ex.Message}", "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ===== DUGME: LOGOUT =====
+        private void btnLogout_Click(object sender, EventArgs e)
+        {
+            if (isConnected)
+            {
+                SendCommand("LOGOUT");
+            }
+        }
+
+        // ===== DUGME: SEND =====
+        private void btnSend_Click(object sender, EventArgs e)
+        {
+            SendBroadcast();
+        }
+
+        // Šalje broadcast poruku
+        private void SendBroadcast()
+        {
+            if (!string.IsNullOrWhiteSpace(txtMessage.Text))
+            {
+                SendCommand($"BROADCAST {txtMessage.Text}");
+                txtMessage.Clear();  // Obriši polje za poruku
+            }
+        }
+
+        // Šalje komandu serveru
+        private void SendCommand(string command)
+        {
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(command);
+                stream.Write(data, 0, data.Length);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Greška pri slanju: {ex.Message}", "Greška");
+            }
+        }
+
+        // Thread koji prima poruke od servera
+        private void ReceiveMessages()
+        {
+            try
+            {
+                byte[] buffer = new byte[1024];
+
+                while (true)
+                {
+                    // Čitaj poruku
+                    int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                    if (bytesRead == 0) break;  // Server zatvorio vezu
+
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                    ProcessServerMessage(message);  // Obradi poruku
+                }
+            }
+            catch { }
+            finally
+            {
+                Disconnect();
+            }
+        }
+
+        // Obrađuje poruke od servera
+        private void ProcessServerMessage(string message)
+        {
+            // ===== OK odgovori =====
+            if (message.StartsWith("OK:"))
+            {
+                string msg = message.Substring(3);
+                AppendMessage("✓ " + msg);
+
+                // Uspješno povezan
+                if (msg.Contains("Uspjesno povezan"))
+                {
+                    isConnected = true;
+                    EnableControls(true);
+
+                    MessageBox.Show("Uspješno ste se povezali na server!", "Uspjeh",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                // Odjavljen
+                else if (msg.Contains("Odjavljeni"))
+                {
+                    MessageBox.Show("Uspješno ste se odjavili.", "Info",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    Disconnect();
+                }
+            }
+            // ===== ERROR odgovori =====
+            else if (message.StartsWith("ERROR:"))
+            {
+                string error = message.Substring(6);
+                AppendMessage("✗ GREŠKA: " + error);
+
+                // Prikaži MessageBox za grešku
+                MessageBox.Show(error, "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                // Ako je kritična greška - diskonektuj
+                if (error.Contains("Server je pun") ||
+                    error.Contains("isteklo") ||
+                    error.Contains("vec postoji"))
+                {
+                    Disconnect();
+                }
+            }
+            // ===== Broadcast poruke =====
+            else
+            {
+                AppendMessage(message);
+            }
+        }
+
+        // Omogućava/onemogućava kontrole
+        private void EnableControls(bool enabled)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<bool>(EnableControls), enabled);
+                return;
+            }
+
+            btnLogout.Enabled = enabled;
+            txtMessage.Enabled = enabled;
+            btnSend.Enabled = enabled;
+        }
+
+        // Dodaje poruku u tekstualni prikaz
+        private void AppendMessage(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<string>(AppendMessage), message);
+                return;
+            }
+
+            txtDisplay.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}\r\n");
+        }
+
+        // Diskonektuje klijenta
+        private void Disconnect()
+        {
+            isConnected = false;
+
+            stream?.Close();
+            client?.Close();
+
+            if (InvokeRequired)
+            {
+                Invoke(new Action(Disconnect));
+                return;
+            }
+
+            // Vrati kontrole u početno stanje
+            btnConnect.Enabled = true;
+            btnLogout.Enabled = false;
+            txtMessage.Enabled = false;
+            btnSend.Enabled = false;
+            txtServer.Enabled = true;
+            txtUsername.Enabled = true;
+
+            AppendMessage("═══ Veza prekinuta ═══");
+        }
+
+        // Zatvaranje forme
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (isConnected)
+            {
+                SendCommand("LOGOUT");
+            }
+            stream?.Close();
+            client?.Close();
+        }
+    }
+}

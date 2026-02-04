@@ -1,0 +1,317 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+// ============================================
+// SERVERSKA APLIKACIJA
+// ============================================
+// KAKO NAPRAVITI FORMU:
+// 1. Otvori Form1 u Designer-u (dvostruki klik na Form1.cs)
+// 2. Prevuci kontrole sa Toolbox-a:
+//    - ListBox (ime: listBoxClients)
+//    - Label (tekst: "Povezani korisnici:")
+// 3. Postavi Properties:
+//    - Form1.Text = "Server"
+//    - Form1.Size = 500, 400
+//    - listBoxClients.Size = 440, 300
+// ============================================
+
+namespace Server
+{
+    public partial class Form1 : Form
+    {
+        // TCP listener koji sluša klijente
+        private TcpListener listener;
+
+        // Lista svih povezanih klijenata
+        private List<ClientHandler> clients = new List<ClientHandler>();
+
+        // Konstantne vrijednosti
+        private const int MAX_CLIENTS = 2;  // Maksimalno 2 klijenta
+        private const int PORT = 5000;       // Port za komunikaciju
+
+        public Form1()
+        {
+            InitializeComponent();
+            StartServer();  // Pokreni server odmah
+        }
+
+        // Pokreće server i počinje da sluša klijente
+        private void StartServer()
+        {
+            listener = new TcpListener(IPAddress.Any, PORT);
+            listener.Start();
+
+            // Pokreni thread koji će prihvatati klijente
+            Thread acceptThread = new Thread(AcceptClients);
+            acceptThread.IsBackground = true;
+            acceptThread.Start();
+
+            MessageBox.Show("Server je pokrenut na portu " + PORT, "Server");
+        }
+
+        // Thread koji prihvata nove klijente
+        private void AcceptClients()
+        {
+            while (true)
+            {
+                try
+                {
+                    // Čekaj da se neki klijent poveže
+                    TcpClient client = listener.AcceptTcpClient();
+
+                    // Provjeri da li je server pun
+                    if (clients.Count >= MAX_CLIENTS)
+                    {
+                        // Server je pun - odbij klijenta
+                        NetworkStream stream = client.GetStream();
+                        byte[] response = Encoding.UTF8.GetBytes("ERROR:Server je pun");
+                        stream.Write(response, 0, response.Length);
+                        client.Close();
+                        continue;
+                    }
+
+                    // Prihvati klijenta i napravi handler za njega
+                    ClientHandler handler = new ClientHandler(client, this);
+                    clients.Add(handler);
+
+                    // Pokreni thread za ovog klijenta
+                    Thread clientThread = new Thread(handler.Handle);
+                    clientThread.IsBackground = true;
+                    clientThread.Start();
+                }
+                catch { break; }
+            }
+        }
+
+        // Ažurira listu korisnika na formi
+        public void UpdateClientList()
+        {
+            // Provjeri da li treba prebaciti poziv na UI thread
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateClientList));
+                return;
+            }
+
+            // Obriši sve stavke
+            listBoxClients.Items.Clear();
+
+            // Dodaj sve klijente u listu
+            foreach (var client in clients)
+            {
+                string status = client.IsAuthenticated ? "Ulogovan" : "Neulogovan";
+                string username = client.Username ?? "Nepoznat";
+                listBoxClients.Items.Add($"{username} - {status}");
+            }
+        }
+
+        // Uklanja klijenta iz liste
+        public void RemoveClient(ClientHandler handler)
+        {
+            clients.Remove(handler);
+            UpdateClientList();
+        }
+
+        // Šalje broadcast poruku svima OSIM pošiljaocu
+        public void BroadcastMessage(string message, ClientHandler sender)
+        {
+            foreach (var client in clients.ToList())
+            {
+                // Ne šalji samom sebi, šalji samo ulogovanima
+                if (client != sender && client.IsAuthenticated)
+                {
+                    client.SendMessage(message);
+                }
+            }
+        }
+
+        // Provjerava da li je username već zauzet
+        public bool IsUsernameTaken(string username)
+        {
+            return clients.Any(c => c.IsAuthenticated && c.Username == username);
+        }
+
+        // Zatvaranje servera
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            listener?.Stop();
+            foreach (var client in clients.ToList())
+            {
+                client.Disconnect();
+            }
+        }
+    }
+
+    // ============================================
+    // KLASA ZA OBRADU JEDNOG KLIJENTA
+    // ============================================
+    public class ClientHandler
+    {
+        private TcpClient client;
+        private NetworkStream stream;
+        private Form1 server;
+
+        // Timer za autentifikaciju (10 sekundi)
+        private System.Timers.Timer authTimer;
+
+        // Timer za neaktivnost (30 sekundi)
+        private System.Timers.Timer inactivityTimer;
+
+        public string Username { get; private set; }
+        public bool IsAuthenticated { get; private set; }
+
+        public ClientHandler(TcpClient client, Form1 server)
+        {
+            this.client = client;
+            this.stream = client.GetStream();
+            this.server = server;
+            this.IsAuthenticated = false;
+
+            // Pokreni timer za autentifikaciju (10 sekundi)
+            authTimer = new System.Timers.Timer(10000);
+            authTimer.Elapsed += (s, e) =>
+            {
+                if (!IsAuthenticated)
+                {
+                    SendMessage("ERROR:Vrijeme za autentifikaciju isteklo");
+                    Disconnect();
+                }
+            };
+            authTimer.AutoReset = false;
+            authTimer.Start();
+
+            server.UpdateClientList();
+        }
+
+        // Glavna petlja koja prima poruke od klijenta
+        public void Handle()
+        {
+            try
+            {
+                byte[] buffer = new byte[1024];
+
+                while (true)
+                {
+                    // Čitaj poruku od klijenta
+                    int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                    if (bytesRead == 0) break;  // Klijent se diskonektovao
+
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                    ProcessCommand(message);  // Obradi komandu
+
+                    // Resetuj timer neaktivnosti
+                    ResetInactivityTimer();
+                }
+            }
+            catch { }
+            finally
+            {
+                Disconnect();
+            }
+        }
+
+        // Obrađuje komande od klijenta
+        private void ProcessCommand(string message)
+        {
+            // ===== CONNECT komanda =====
+            if (message.StartsWith("CONNECT "))
+            {
+                string username = message.Substring(8).Trim();
+
+                // Provjera: Da li je već ulogovan?
+                if (IsAuthenticated)
+                {
+                    SendMessage("ERROR:Vec ste ulogovani");
+                    return;
+                }
+
+                // Provjera: Da li je username već zauzet?
+                if (server.IsUsernameTaken(username))
+                {
+                    SendMessage("ERROR:Korisnik vec postoji");
+                    return;
+                }
+
+                // SVE OK - prijavi korisnika
+                Username = username;
+                IsAuthenticated = true;
+                authTimer.Stop();
+                SendMessage("OK:Uspjesno povezan");
+                server.UpdateClientList();
+                StartInactivityTimer();  // Pokreni timer za neaktivnost
+            }
+            // ===== LOGOUT komanda =====
+            else if (message == "LOGOUT")
+            {
+                if (IsAuthenticated)
+                {
+                    SendMessage("OK:Odjavljeni ste");
+                    Disconnect();
+                }
+            }
+            // ===== BROADCAST komanda =====
+            else if (message.StartsWith("BROADCAST "))
+            {
+                // Provjera: Da li je ulogovan?
+                if (!IsAuthenticated)
+                {
+                    SendMessage("ERROR:Morate se prvo ulogovati");
+                    return;
+                }
+
+                // Izvuci poruku i pošalji svima
+                string broadcastMsg = message.Substring(10);
+                server.BroadcastMessage($"{Username}: {broadcastMsg}", this);
+            }
+        }
+
+        // Pokreće timer za neaktivnost (30 sekundi)
+        private void StartInactivityTimer()
+        {
+            inactivityTimer = new System.Timers.Timer(30000);  // 30 sekundi
+            inactivityTimer.Elapsed += (s, e) =>
+            {
+                Disconnect();  // Diskonektuj klijenta
+            };
+            inactivityTimer.AutoReset = false;
+            inactivityTimer.Start();
+        }
+
+        // Resetuje timer neaktivnosti
+        private void ResetInactivityTimer()
+        {
+            inactivityTimer?.Stop();
+            if (IsAuthenticated)
+            {
+                StartInactivityTimer();
+            }
+        }
+
+        // Šalje poruku klijentu
+        public void SendMessage(string message)
+        {
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(message);
+                stream.Write(data, 0, data.Length);
+            }
+            catch { }
+        }
+
+        // Diskonektuje klijenta
+        public void Disconnect()
+        {
+            authTimer?.Stop();
+            inactivityTimer?.Stop();
+            stream?.Close();
+            client?.Close();
+            server.RemoveClient(this);
+        }
+    }
+}
