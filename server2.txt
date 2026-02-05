@@ -1,0 +1,282 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace Server
+{
+    public partial class Form1 : Form
+    {
+        private TcpListener listener;
+        private List<ClientHandler> clients = new List<ClientHandler>();
+
+        // LISTA DOZVOLJENIH KORISNIKA
+        private List<string> dozvoljeniKorisnici = new List<string> { "ana", "marko", "ivan", "pera" };
+
+        private const int MAX_CLIENTS = 2;
+        private const int PORT = 5000;
+
+        public Form1()
+        {
+            InitializeComponent();
+            StartServer();
+        }
+
+        private void StartServer()
+        {
+            listener = new TcpListener(IPAddress.Any, PORT);
+            listener.Start();
+
+            Thread acceptThread = new Thread(AcceptClients);
+            acceptThread.IsBackground = true;
+            acceptThread.Start();
+
+            MessageBox.Show("Server je pokrenut na portu " + PORT, "Server");
+        }
+
+        private void AcceptClients()
+        {
+            while (true)
+            {
+                try
+                {
+                    TcpClient client = listener.AcceptTcpClient();
+
+                    // Provjeri da li je server pun
+                    if (clients.Count >= MAX_CLIENTS)
+                    {
+                        NetworkStream stream = client.GetStream();
+                        byte[] response = Encoding.UTF8.GetBytes("ERROR:Server je pun");
+                        stream.Write(response, 0, response.Length);
+                        client.Close();
+                        continue;
+                    }
+
+                    ClientHandler handler = new ClientHandler(client, this);
+                    clients.Add(handler);
+
+                    Thread clientThread = new Thread(handler.Handle);
+                    clientThread.IsBackground = true;
+                    clientThread.Start();
+                }
+                catch { break; }
+            }
+        }
+
+        // Provjerava da li je username na listi dozvoljenih
+        public bool IsUsernameAllowed(string username)
+        {
+            return dozvoljeniKorisnici.Contains(username);
+        }
+
+        public void UpdateClientList()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(UpdateClientList));
+                return;
+            }
+
+            listBoxClients.Items.Clear();
+
+            foreach (var client in clients)
+            {
+                string status = client.IsAuthenticated ? "Ulogovan" : "Neulogovan";
+                string username = client.Username ?? "Nepoznat";
+                listBoxClients.Items.Add($"{username} - {status}");
+            }
+        }
+
+        public void RemoveClient(ClientHandler handler)
+        {
+            clients.Remove(handler);
+            UpdateClientList();
+        }
+
+        public void BroadcastMessage(string message, ClientHandler sender)
+        {
+            foreach (var client in clients.ToList())
+            {
+                if (client != sender && client.IsAuthenticated)
+                {
+                    client.SendMessage(message);
+                }
+            }
+        }
+
+        public bool IsUsernameTaken(string username)
+        {
+            return clients.Any(c => c.IsAuthenticated && c.Username == username);
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            listener?.Stop();
+            foreach (var client in clients.ToList())
+            {
+                client.Disconnect();
+            }
+        }
+    }
+
+    public class ClientHandler
+    {
+        private TcpClient client;
+        private NetworkStream stream;
+        private Form1 server;
+        private System.Timers.Timer authTimer;
+        private System.Timers.Timer inactivityTimer;
+
+        public string Username { get; private set; }
+        public bool IsAuthenticated { get; private set; }
+
+        public ClientHandler(TcpClient client, Form1 server)
+        {
+            this.client = client;
+            this.stream = client.GetStream();
+            this.server = server;
+            this.IsAuthenticated = false;
+
+            // Timer za autentifikaciju (10 sekundi)
+            authTimer = new System.Timers.Timer(10000);
+            authTimer.Elapsed += (s, e) =>
+            {
+                if (!IsAuthenticated)
+                {
+                    SendMessage("ERROR:Vrijeme za autentifikaciju isteklo");
+                    Disconnect();
+                }
+            };
+            authTimer.AutoReset = false;
+            authTimer.Start();
+
+            server.UpdateClientList();
+        }
+
+        public void Handle()
+        {
+            try
+            {
+                byte[] buffer = new byte[1024];
+
+                while (true)
+                {
+                    int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                    if (bytesRead == 0) break;
+
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                    ProcessCommand(message);
+
+                    ResetInactivityTimer();
+                }
+            }
+            catch { }
+            finally
+            {
+                Disconnect();
+            }
+        }
+
+        private void ProcessCommand(string message)
+        {
+            // ===== CONNECT komanda =====
+            if (message.StartsWith("CONNECT "))
+            {
+                string username = message.Substring(8).Trim();
+
+                // Provjera 1: Da li je već ulogovan?
+                if (IsAuthenticated)
+                {
+                    SendMessage("ERROR:Vec ste ulogovani");
+                    return;
+                }
+
+                // Provjera 2: Da li je username na listi dozvoljenih?
+                if (!server.IsUsernameAllowed(username))
+                {
+                    SendMessage("ERROR:Niste na listi dozvoljenih korisnika");
+                    return;
+                }
+
+                // Provjera 3: Da li je username već zauzet?
+                if (server.IsUsernameTaken(username))
+                {
+                    SendMessage("ERROR:Korisnik vec postoji");
+                    return;
+                }
+
+                // SVE OK - prijavi korisnika
+                Username = username;
+                IsAuthenticated = true;
+                authTimer.Stop();
+                SendMessage("OK:Uspjesno povezan");
+                server.UpdateClientList();
+                StartInactivityTimer();
+            }
+            // ===== LOGOUT komanda =====
+            else if (message == "LOGOUT")
+            {
+                if (IsAuthenticated)
+                {
+                    SendMessage("OK:Odjavljeni ste");
+                    Disconnect();
+                }
+            }
+            // ===== BROADCAST komanda =====
+            else if (message.StartsWith("BROADCAST "))
+            {
+                if (!IsAuthenticated)
+                {
+                    SendMessage("ERROR:Morate se prvo ulogovati");
+                    return;
+                }
+
+                string broadcastMsg = message.Substring(10);
+                server.BroadcastMessage($"{Username}: {broadcastMsg}", this);
+            }
+        }
+
+        private void StartInactivityTimer()
+        {
+            inactivityTimer = new System.Timers.Timer(30000);
+            inactivityTimer.Elapsed += (s, e) =>
+            {
+                Disconnect();
+            };
+            inactivityTimer.AutoReset = false;
+            inactivityTimer.Start();
+        }
+
+        private void ResetInactivityTimer()
+        {
+            inactivityTimer?.Stop();
+            if (IsAuthenticated)
+            {
+                StartInactivityTimer();
+            }
+        }
+
+        public void SendMessage(string message)
+        {
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(message);
+                stream.Write(data, 0, data.Length);
+            }
+            catch { }
+        }
+
+        public void Disconnect()
+        {
+            authTimer?.Stop();
+            inactivityTimer?.Stop();
+            stream?.Close();
+            client?.Close();
+            server.RemoveClient(this);
+        }
+    }
+}

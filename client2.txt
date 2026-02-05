@@ -1,0 +1,248 @@
+using System;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace Client
+{
+    public partial class Form1 : Form
+    {
+        private TcpClient client;
+        private NetworkStream stream;
+        private Thread receiveThread;
+        private bool isConnected = false;
+        private System.Timers.Timer formCloseTimer;
+
+        public Form1()
+        {
+            InitializeComponent();
+            StartFormCloseTimer();
+        }
+
+        private void StartFormCloseTimer()
+        {
+            formCloseTimer = new System.Timers.Timer(10000);
+            formCloseTimer.Elapsed += (s, e) =>
+            {
+                if (!isConnected)
+                {
+                    CloseForm();
+                }
+            };
+            formCloseTimer.AutoReset = false;
+            formCloseTimer.Start();
+        }
+
+        private void CloseForm()
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(CloseForm));
+                return;
+            }
+
+            MessageBox.Show("Niste se ulogovali za 10 sekundi. Aplikacija se zatvara.",
+                "Timeout", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+
+            this.Close();
+        }
+
+        private void btnConnect_Click(object sender, EventArgs e)
+        {
+            if (string.IsNullOrWhiteSpace(txtUsername.Text))
+            {
+                MessageBox.Show("Morate unijeti username!", "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            try
+            {
+                client = new TcpClient();
+                client.Connect(txtServer.Text, 5000);
+                stream = client.GetStream();
+
+                string connectCmd = $"CONNECT {txtUsername.Text}";
+                byte[] data = Encoding.UTF8.GetBytes(connectCmd);
+                stream.Write(data, 0, data.Length);
+
+                receiveThread = new Thread(ReceiveMessages);
+                receiveThread.IsBackground = true;
+                receiveThread.Start();
+
+                btnConnect.Enabled = false;
+                txtServer.Enabled = false;
+                txtUsername.Enabled = false;
+
+                AppendMessage("Pokušavam povezivanje...");
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Greška pri povezivanju:\n{ex.Message}", "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void btnLogout_Click(object sender, EventArgs e)
+        {
+            if (isConnected)
+            {
+                SendCommand("LOGOUT");
+            }
+        }
+
+        private void btnSend_Click(object sender, EventArgs e)
+        {
+            SendBroadcast();
+        }
+
+        private void SendBroadcast()
+        {
+            if (!string.IsNullOrWhiteSpace(txtMessage.Text))
+            {
+                SendCommand($"BROADCAST {txtMessage.Text}");
+                txtMessage.Clear();
+            }
+        }
+
+        private void SendCommand(string command)
+        {
+            try
+            {
+                byte[] data = Encoding.UTF8.GetBytes(command);
+                stream.Write(data, 0, data.Length);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Greška pri slanju: {ex.Message}", "Greška");
+            }
+        }
+
+        private void ReceiveMessages()
+        {
+            try
+            {
+                byte[] buffer = new byte[1024];
+
+                while (true)
+                {
+                    int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                    if (bytesRead == 0) break;
+
+                    string message = Encoding.UTF8.GetString(buffer, 0, bytesRead).Trim();
+                    ProcessServerMessage(message);
+                }
+            }
+            catch { }
+            finally
+            {
+                Disconnect();
+            }
+        }
+
+        private void ProcessServerMessage(string message)
+        {
+            // ===== OK odgovori =====
+            if (message.StartsWith("OK:"))
+            {
+                string msg = message.Substring(3);
+                AppendMessage("✓ " + msg);
+
+                if (msg.Contains("Uspjesno povezan"))
+                {
+                    isConnected = true;
+                    EnableControls(true);
+
+                    MessageBox.Show("Uspješno ste se povezali na server!", "Uspjeh",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else if (msg.Contains("Odjavljeni"))
+                {
+                    MessageBox.Show("Uspješno ste se odjavili.", "Info",
+                        MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    Disconnect();
+                }
+            }
+            // ===== ERROR odgovori =====
+            else if (message.StartsWith("ERROR:"))
+            {
+                string error = message.Substring(6);
+                AppendMessage("✗ GREŠKA: " + error);
+
+                MessageBox.Show(error, "Greška",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                if (error.Contains("Server je pun") ||
+                    error.Contains("isteklo") ||
+                    error.Contains("vec postoji") ||
+                    error.Contains("Niste na listi"))
+                {
+                    Disconnect();
+                }
+            }
+            // ===== Broadcast poruke =====
+            else
+            {
+                AppendMessage(message);
+            }
+        }
+
+        private void EnableControls(bool enabled)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<bool>(EnableControls), enabled);
+                return;
+            }
+
+            btnLogout.Enabled = enabled;
+            txtMessage.Enabled = enabled;
+            btnSend.Enabled = enabled;
+        }
+
+        private void AppendMessage(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<string>(AppendMessage), message);
+                return;
+            }
+
+            txtDisplay.AppendText($"[{DateTime.Now:HH:mm:ss}] {message}\r\n");
+        }
+
+        private void Disconnect()
+        {
+            isConnected = false;
+
+            stream?.Close();
+            client?.Close();
+
+            if (InvokeRequired)
+            {
+                Invoke(new Action(Disconnect));
+                return;
+            }
+
+            btnConnect.Enabled = true;
+            btnLogout.Enabled = false;
+            txtMessage.Enabled = false;
+            btnSend.Enabled = false;
+            txtServer.Enabled = true;
+            txtUsername.Enabled = true;
+
+            AppendMessage("═══ Veza prekinuta ═══");
+        }
+
+        private void Form1_FormClosing(object sender, FormClosingEventArgs e)
+        {
+            if (isConnected)
+            {
+                SendCommand("LOGOUT");
+            }
+            stream?.Close();
+            client?.Close();
+        }
+    }
+}
